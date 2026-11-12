@@ -161,3 +161,22 @@ export const fetchFreshCaptionsAction = async (
 
   return ordered.slice(0, limit);
 };
+
+/**
+ * Read a caption's current net score as maintained by the database trigger.
+ * Used after a vote so the feed shows the real value rather than a local guess.
+ */
+export const fetchCaptionScoreAction = async (captionId: string): Promise<number | null> => {
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("captions")
+    .select("like_count")
+    .eq("id", captionId)
+    .maybeSingle();
+
+  if (error) {
+    console.error("Error fetching caption score:", error);
+    return null;
+  }
+  return data?.like_count ?? null;
+};

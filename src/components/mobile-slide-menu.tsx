@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { X, Menu, Sparkles, TrendingUp, Heart, Image as ImageIcon, Shuffle } from "lucide-react";
+import { X, Menu, Sparkles, TrendingUp, Heart, Image as ImageIcon, Shuffle, ListChecks } from "lucide-react";
 import { UserHeaderMenu } from "./user-header-menu";
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
@@ -63,6 +63,11 @@ export default function MobileSlideMenu({
       label: "Fresh",
       href: "/fresh",
       icon: Shuffle,
+    },
+    {
+      label: "Votes",
+      href: "/votes",
+      icon: ListChecks,
     },
     {
       label: "Favorites",

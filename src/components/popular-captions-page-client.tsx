@@ -29,6 +29,7 @@ import {
 import { CaptionModal } from "@/components/ui/caption-modal";
 import { BookmarkButton } from "@/components/ui/bookmark-button";
 import { Top100CaptionImage } from "@/components/top-100-caption-image";
+import MyRatingsList from "@/components/my-ratings-list";
 
 // functions to load in our pregenrated thumbnails
 const THUMBNAIL_SIZES = [320, 480, 640, 750, 828, 1080, 1200, 1920, 2048, 3840] as const;
@@ -179,6 +180,47 @@ export default function PopularCaptionsPageClient({
 
     fetchSavedCaptions();
   }, [isAuthenticated]);
+
+  // Deep link from "Your votes": /top-100/all-time#caption-<id> reveals that
+  // caption's spot (loading enough pages to include it), scrolls to it and
+  // highlights it.
+  const [highlightedId, setHighlightedId] = useState<string | null>(null);
+  useEffect(() => {
+    let scroll: number | undefined;
+    let rescroll: number | undefined;
+    let clear: number | undefined;
+    const reveal = () => {
+      const match = window.location.hash.match(/^#caption-(.+)$/);
+      if (!match) return;
+      const targetId = decodeURIComponent(match[1]);
+      const position = popularCaptions.findIndex((c) => c.id === targetId);
+      if (position === -1) return;
+      setVisibleCount((count) =>
+        Math.max(count, Math.ceil((position + 1) / itemsPerPage) * itemsPerPage)
+      );
+      setHighlightedId(targetId);
+      window.clearTimeout(scroll);
+      window.clearTimeout(rescroll);
+      window.clearTimeout(clear);
+      const scrollToTarget = (behavior: ScrollBehavior) =>
+        document
+          .getElementById(`caption-${targetId}`)
+          ?.scrollIntoView({ behavior, block: "center" });
+      // Wait for the extra cards to render, then scroll again once images
+      // above it have loaded and shifted the layout.
+      scroll = window.setTimeout(() => scrollToTarget("auto"), 150);
+      rescroll = window.setTimeout(() => scrollToTarget("smooth"), 900);
+      clear = window.setTimeout(() => setHighlightedId(null), 6000);
+    };
+    reveal();
+    window.addEventListener("hashchange", reveal);
+    return () => {
+      window.removeEventListener("hashchange", reveal);
+      window.clearTimeout(scroll);
+      window.clearTimeout(rescroll);
+      window.clearTimeout(clear);
+    };
+  }, [popularCaptions, itemsPerPage]);
 
   const handleVote = async (captionId: string, voteValue: 1 | -1) => {
     if (!isAuthenticated) {
@@ -331,6 +373,12 @@ export default function PopularCaptionsPageClient({
 
   const visibleCaptions = popularCaptions.slice(0, visibleCount);
   const hasMore = visibleCount < popularCaptions.length;
+  const recentVotesPeriod =
+    filter === "week"
+      ? { days: 7, label: "in the past week" }
+      : filter === "past30"
+        ? { days: 30, label: "in the past month" }
+        : null;
 
   if (isLoading) {
     return (
@@ -466,6 +514,50 @@ export default function PopularCaptionsPageClient({
           ))}
         </div>
       </div>
+
+      {/* The user's own recent votes (PM feedback: show them here rather than
+          on a separate page). Filtered by when they voted, not by when the
+          caption was created. */}
+      {isAuthenticated && recentVotesPeriod && (
+        <section
+          id="your-votes"
+          aria-labelledby="your-votes-heading"
+          className="w-full max-w-7xl mx-auto px-4 mb-6 scroll-mt-24"
+        >
+          <h2 id="your-votes-heading" className="text-xl sm:text-2xl font-bold tracking-tight">
+            Your recent votes
+          </h2>
+          <p className="mt-1 mb-3 text-sm text-muted-foreground">
+            {`Captions you voted on ${recentVotesPeriod.label} and how they're doing. ` +
+              "Tap an arrow to change your vote, or tap it again to remove it."}
+          </p>
+          <MyRatingsList
+            key={filter}
+            sinceDays={recentVotesPeriod.days}
+            periodLabel={recentVotesPeriod.label}
+            pageSize={4}
+            columns={2}
+            emptyText={`You haven't voted on any captions ${recentVotesPeriod.label}.`}
+            onVoteChange={(captionId, vote, score) => {
+              // Keep the same caption's card in the ranked grid in step.
+              setUserVotes((prev) => ({ ...prev, [captionId]: vote }));
+              setPopularCaptions((prev) =>
+                prev.map((c) => (c.id === captionId ? { ...c, like_count: score } : c))
+              );
+            }}
+            emptyAction={
+              <Link
+                href="/fresh"
+                className="shrink-0 px-4 py-2 rounded-full bg-primary text-white text-sm
+                           font-medium hover:bg-primary/90 transition-colors"
+              >
+                Rate captions in Fresh
+              </Link>
+            }
+          />
+        </section>
+      )}
+
       <div className="flex-1 w-full flex flex-col gap-8 p-4 relative">
         <div className="flex justify-end items-center w-full max-w-7xl mx-auto px-4">
             <div className="flex items-center gap-4">
@@ -506,7 +598,11 @@ export default function PopularCaptionsPageClient({
           </div>
         </div>
       {visibleCaptions.length === 0 ? (
-        <p className="text-center text-gray-400 mt-12 text-lg">No captions found.</p>
+        <p className="text-center text-gray-400 mt-12 text-lg">
+          {recentVotesPeriod
+            ? `No captions created ${recentVotesPeriod.label} have been voted up yet.`
+            : "No captions found."}
+        </p>
       ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-6">
           {visibleCaptions.map((caption, index) => {
@@ -530,7 +626,13 @@ export default function PopularCaptionsPageClient({
             return (
               <div
                 key={caption.id}
-                className="relative cursor-pointer group w-full h-full flex"
+                id={`caption-${caption.id}`}
+                className={`relative cursor-pointer group w-full h-full flex scroll-mt-24 rounded-lg
+                  transition-shadow duration-500 ${
+                    highlightedId === caption.id
+                      ? "ring-4 ring-primary ring-offset-2 ring-offset-background"
+                      : ""
+                  }`}
                 onClick={() => handleImageClick(index)}
               >
                 <div

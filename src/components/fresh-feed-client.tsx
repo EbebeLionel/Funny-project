@@ -13,6 +13,7 @@ import {
 import { ChevronUp, ChevronDown, SkipForward, Undo2 } from "lucide-react";
 import {
   fetchCaptionScoreAction,
+  fetchCaptionScoresAction,
   fetchFreshCaptionsAction,
   type FreshCaption,
 } from "@/app/actions/captions/fetch-fresh-captions-action";
@@ -22,11 +23,28 @@ import { LoginPromptModal } from "@/components/ui/login-prompt-modal";
 import { Top100CaptionImage } from "@/components/top-100-caption-image";
 import { BrandImage } from "@/components/brand-image";
 import { useToast } from "@/hooks/use-toast";
+import { cn } from "@/lib/utils";
 
 type FreshFeedClientProps = {
   initialCaptions: FreshCaption[];
   initialIsAuthenticated: boolean;
 };
+
+/** Where a user finds every caption they voted on recently. */
+const RECENT_VOTES_HREF = "/top-100/past-week";
+
+/** A vote saved in this session, newest first. */
+type SessionRating = {
+  caption: FreshCaption;
+  vote: 1 | -1;
+  /** Live score: a local estimate until the real one arrives, then refreshed. */
+  score: number;
+};
+
+/** How many recent ratings the strip under the card shows. */
+const STRIP_SIZE = 4;
+/** How often (ms) the strip and recap refresh their scores. */
+const SCORE_REFRESH_MS = 15000;
 
 /** Fetch more when this many captions remain in the queue. */
 const REFILL_THRESHOLD = 5;
@@ -199,12 +217,70 @@ const SwipeCard = forwardRef<HTMLDivElement, SwipeCardProps>(function SwipeCard(
 /* Feed                                                                      */
 /* ------------------------------------------------------------------------ */
 
+function RatingThumb({
+  rating,
+  onClick,
+}: {
+  rating: SessionRating;
+  onClick: () => void;
+}) {
+  return (
+    <motion.button
+      type="button"
+      layout
+      initial={{ opacity: 0, scale: 0.8 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.8 }}
+      transition={{ type: "spring", stiffness: 420, damping: 30 }}
+      onClick={onClick}
+      className="group relative w-16 h-16 sm:w-20 sm:h-20 shrink-0 overflow-hidden rounded-xl
+                 bg-gray-200 dark:bg-neutral-900"
+      title={rating.caption.content}
+      aria-label={
+        `${rating.vote === 1 ? "Funny" : "Not funny"}: ${rating.caption.content}. ` +
+        `Score ${formatScore(rating.score)}`
+      }
+    >
+      <img
+        src={rating.caption.image_url}
+        alt=""
+        className="absolute inset-0 w-full h-full object-cover transition-transform
+                   group-hover:scale-105"
+        loading="lazy"
+      />
+      <span
+        className={cn(
+          "absolute left-1 top-1 flex items-center justify-center w-5 h-5 rounded-full text-white",
+          rating.vote === 1 ? "bg-primary" : "bg-gray-600"
+        )}
+        aria-hidden="true"
+      >
+        {rating.vote === 1 ? (
+          <ChevronUp className="w-3.5 h-3.5" />
+        ) : (
+          <ChevronDown className="w-3.5 h-3.5" />
+        )}
+      </span>
+      <span
+        className="absolute inset-x-0 bottom-0 bg-black/65 py-0.5 text-center text-xs
+                   font-semibold text-white"
+        aria-hidden="true"
+      >
+        {formatScore(rating.score)}
+      </span>
+    </motion.button>
+  );
+}
+
 export default function FreshFeedClient({
   initialCaptions,
   initialIsAuthenticated,
 }: FreshFeedClientProps) {
   const router = useRouter();
   const { toast } = useToast();
+
+  const [sessionRatings, setSessionRatings] = useState<SessionRating[]>([]);
+  const openRecentVotes = useCallback(() => router.push(RECENT_VOTES_HREF), [router]);
 
   const [queue, setQueue] = useState<FreshCaption[]>(initialCaptions);
   const [index, setIndex] = useState(0);
@@ -326,12 +402,19 @@ export default function FreshFeedClient({
           setLastRating((prev) =>
             prev?.caption.id === caption.id ? { ...prev, status: "saved" } : prev
           );
+          setSessionRatings((prev) => [
+            { caption, vote, score: caption.like_count + vote },
+            ...prev.filter((r) => r.caption.id !== caption.id),
+          ]);
 
           // Replace the local estimate with the trigger-maintained score.
           const realScore = await fetchCaptionScoreAction(caption.id);
           if (realScore !== null) {
             setLastRating((prev) =>
               prev?.caption.id === caption.id ? { ...prev, score: realScore } : prev
+            );
+            setSessionRatings((prev) =>
+              prev.map((r) => (r.caption.id === caption.id ? { ...r, score: realScore } : r))
             );
           }
         } catch (error) {
@@ -368,6 +451,7 @@ export default function FreshFeedClient({
         await toggleCaptionVoteAction(caption.id, vote);
         setRatedCount((n) => Math.max(0, n - 1));
         setLastRating(null);
+        setSessionRatings((prev) => prev.filter((r) => r.caption.id !== caption.id));
         restore(caption);
       } catch (error) {
         console.error("Undo failed:", error);
@@ -418,12 +502,225 @@ export default function FreshFeedClient({
   };
 
   const isFinished = !current && exhausted && !isLoadingMore;
+  // The feed widens to older captions once every near-zero caption is rated.
+  const sawOlderPool = queue.some((c) => c.from_older_pool);
+
+  // Keep the scores in the strip (or the end-screen recap) live while the page
+  // is visible.
+  const liveIds = (isFinished ? sessionRatings : sessionRatings.slice(0, STRIP_SIZE))
+    .map((r) => r.caption.id)
+    .join(",");
+  useEffect(() => {
+    if (!liveIds) return;
+    const ids = liveIds.split(",");
+    const refresh = async () => {
+      if (document.visibilityState !== "visible") return;
+      const scores = await fetchCaptionScoresAction(ids);
+      setSessionRatings((prev) =>
+        prev.map((r) => (r.caption.id in scores ? { ...r, score: scores[r.caption.id] } : r))
+      );
+    };
+    const timer = window.setInterval(() => void refresh(), SCORE_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [liveIds]);
+
+  const ratePanel = (
+    <>
+      {/* Result of the last vote */}
+      <div className="min-h-[2.75rem] mb-4">
+        <AnimatePresence>
+          {lastRating && !isFinished && (
+            <motion.div
+              key={lastRating.caption.id}
+              initial={{ opacity: 0, y: -6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.18 }}
+              className="rounded-xl bg-gray-50 dark:bg-neutral-800 px-4 py-2 text-sm
+                         flex items-center gap-2"
+              aria-live="polite"
+            >
+              {lastRating.vote === 1 ? (
+                <ChevronUp className="w-4 h-4 text-primary shrink-0" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-primary shrink-0" />
+              )}
+              <span className="flex-1">
+                {lastRating.status === "saving" ? (
+                  "Saving your vote…"
+                ) : lastRating.status === "undoing" ? (
+                  "Undoing…"
+                ) : (
+                  <>
+                    Vote saved. That caption&apos;s score is now{" "}
+                    <span className="font-semibold">{formatScore(lastRating.score)}</span>.
+                  </>
+                )}
+              </span>
+              <button
+                type="button"
+                onClick={handleUndo}
+                disabled={lastRating.status !== "saved"}
+                className="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium
+                           text-primary hover:bg-primary/10 transition-colors
+                           disabled:opacity-50 disabled:hover:bg-transparent"
+                aria-label="Undo last vote (Backspace)"
+              >
+                <Undo2 className="w-3.5 h-3.5" />
+                Undo
+                <kbd className="text-[10px] text-muted-foreground hidden sm:inline">⌫</kbd>
+              </button>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* Explain the switch to older captions (Iteration 1 gap) */}
+      {current?.from_older_pool && (
+        <p
+          className="mb-4 rounded-xl border border-dashed border-[#666363] px-4 py-2 text-sm
+                     text-muted-foreground"
+          role="status"
+        >
+          You&apos;ve rated every new caption. Now showing older captions you haven&apos;t
+          voted on yet.
+        </p>
+      )}
+
+      {/* Card */}
+      {current ? (
+        <div className="relative">
+          <AnimatePresence mode="popLayout" custom={exitDirection} initial={false}>
+            <SwipeCard
+              key={current.id}
+              caption={current}
+              onVote={handleVote}
+              onSkip={handleSkip}
+            />
+          </AnimatePresence>
+          <p className="mt-3 text-center text-xs text-muted-foreground sm:hidden">
+            Swipe right for funny, left for not funny.
+          </p>
+        </div>
+      ) : isFinished ? (
+        <div
+          className="bg-gray-50 dark:bg-neutral-800 rounded-2xl p-6 sm:p-8 flex flex-col
+                     items-center text-center gap-4"
+        >
+          <BrandImage variant="mark" alt="Crackd Logo" className="w-16 h-16" />
+          <h2 className="text-2xl font-bold">
+            {sawOlderPool ? "You've rated everything available" : "You've seen everything fresh"}
+          </h2>
+          <p className="text-sm text-muted-foreground max-w-sm">
+            {sawOlderPool
+              ? "You rated every new caption, then went through the older ones " +
+                "you hadn't voted on. "
+              : ""}
+            Check back later for new captions, or see what&apos;s winning right now.
+          </p>
+
+          {sessionRatings.length > 0 && (
+            <div className="w-full text-left">
+              <h3 className="mb-2 text-sm font-semibold">
+                This session: {sessionRatings.length} caption
+                {sessionRatings.length === 1 ? "" : "s"} rated
+              </h3>
+              <ul className="space-y-2 max-h-[22rem] overflow-y-auto pr-1">
+                {sessionRatings.map((r) => (
+                  <li
+                    key={r.caption.id}
+                    className="flex items-center gap-3 rounded-xl bg-white dark:bg-neutral-900 p-2"
+                  >
+                    <img
+                      src={r.caption.image_url}
+                      alt=""
+                      className="w-12 h-12 shrink-0 rounded-lg object-cover"
+                      loading="lazy"
+                    />
+                    <p className="flex-1 min-w-0 text-sm leading-snug line-clamp-2">
+                      {r.caption.content}
+                    </p>
+                    <span
+                      className={cn(
+                        "flex items-center justify-center w-6 h-6 shrink-0 rounded-full text-white",
+                        r.vote === 1 ? "bg-primary" : "bg-gray-600"
+                      )}
+                      aria-label={r.vote === 1 ? "You voted funny" : "You voted not funny"}
+                    >
+                      {r.vote === 1 ? (
+                        <ChevronUp className="w-4 h-4" />
+                      ) : (
+                        <ChevronDown className="w-4 h-4" />
+                      )}
+                    </span>
+                    <span className="w-10 shrink-0 text-right text-sm font-semibold">
+                      {formatScore(r.score)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="flex flex-wrap justify-center gap-3">
+            <Link
+              href={sessionRatings.length > 0 ? RECENT_VOTES_HREF : "/top-100/all-time"}
+              className="px-4 py-2 rounded-full bg-primary text-white text-sm font-medium
+                         hover:bg-primary/90 transition-colors"
+            >
+              {sessionRatings.length > 0 ? "See your votes in Top 100" : "Go to Top 100"}
+            </Link>
+            <button
+              type="button"
+              onClick={() => void handleStartOver()}
+              className="px-4 py-2 rounded-full border border-[#666363] text-sm font-medium
+                         hover:bg-gray-100 dark:hover:bg-neutral-700 transition-colors"
+            >
+              Start over
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div
+          className="bg-gray-50 dark:bg-neutral-800 rounded-2xl aspect-[4/5] sm:aspect-square
+                     animate-pulse"
+          aria-busy="true"
+          aria-label="Loading captions"
+        />
+      )}
+
+      {/* Recently rated strip */}
+      {current && sessionRatings.length > 0 && (
+        <section className="mt-5" aria-label="Recently rated">
+          <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
+            <span>Recently rated · live scores</span>
+            <Link href={RECENT_VOTES_HREF} className="font-medium text-primary hover:underline">
+              See all in Top 100
+            </Link>
+          </div>
+          <div className="flex gap-2">
+            <AnimatePresence mode="popLayout" initial={false}>
+              {sessionRatings.slice(0, STRIP_SIZE).map((r) => (
+                <RatingThumb key={r.caption.id} rating={r} onClick={openRecentVotes} />
+              ))}
+            </AnimatePresence>
+          </div>
+        </section>
+      )}
+
+      {!isAuthenticated && current && (
+        <p className="mt-4 text-center text-xs text-muted-foreground">
+          You can browse without an account. Voting asks you to log in.
+        </p>
+      )}
+    </>
+  );
 
   return (
     <div className="min-h-screen bg-white dark:bg-black text-gray-900 dark:text-white">
       <div className="container mx-auto px-4 py-6 sm:py-10 max-w-2xl">
         {/* Header */}
-        <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-6">
+        <div className="flex flex-col sm:flex-row sm:items-end sm:justify-between gap-3 mb-5">
           <div>
             <h1 className="text-3xl sm:text-4xl font-bold tracking-tight">Fresh</h1>
             <p className="text-sm text-muted-foreground mt-1">
@@ -431,123 +728,15 @@ export default function FreshFeedClient({
             </p>
           </div>
           <div
-            className="self-start sm:self-auto rounded-full border border-[#666363] px-3 py-1
-                       text-sm text-muted-foreground"
+            className="self-start sm:self-auto shrink-0 rounded-full border border-[#666363]
+                       px-3 py-1 text-sm text-muted-foreground"
             aria-live="polite"
           >
             Rated today: <span className="text-primary font-semibold">{ratedCount}</span>
           </div>
         </div>
 
-        {/* Result of the last vote */}
-        <div className="min-h-[2.75rem] mb-4">
-          <AnimatePresence>
-            {lastRating && !isFinished && (
-              <motion.div
-                key={lastRating.caption.id}
-                initial={{ opacity: 0, y: -6 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -6 }}
-                transition={{ duration: 0.18 }}
-                className="rounded-xl bg-gray-50 dark:bg-neutral-800 px-4 py-2 text-sm
-                           flex items-center gap-2"
-                aria-live="polite"
-              >
-                {lastRating.vote === 1 ? (
-                  <ChevronUp className="w-4 h-4 text-primary shrink-0" />
-                ) : (
-                  <ChevronDown className="w-4 h-4 text-primary shrink-0" />
-                )}
-                <span className="flex-1">
-                  {lastRating.status === "saving" ? (
-                    "Saving your vote…"
-                  ) : lastRating.status === "undoing" ? (
-                    "Undoing…"
-                  ) : (
-                    <>
-                      Vote saved. That caption&apos;s score is now{" "}
-                      <span className="font-semibold">{formatScore(lastRating.score)}</span>.
-                    </>
-                  )}
-                </span>
-                <button
-                  type="button"
-                  onClick={handleUndo}
-                  disabled={lastRating.status !== "saved"}
-                  className="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium
-                             text-primary hover:bg-primary/10 transition-colors
-                             disabled:opacity-50 disabled:hover:bg-transparent"
-                  aria-label="Undo last vote (Backspace)"
-                >
-                  <Undo2 className="w-3.5 h-3.5" />
-                  Undo
-                  <kbd className="text-[10px] text-muted-foreground hidden sm:inline">⌫</kbd>
-                </button>
-              </motion.div>
-            )}
-          </AnimatePresence>
-        </div>
-
-        {/* Card */}
-        {current ? (
-          <div className="relative">
-            <AnimatePresence mode="popLayout" custom={exitDirection} initial={false}>
-              <SwipeCard
-                key={current.id}
-                caption={current}
-                onVote={handleVote}
-                onSkip={handleSkip}
-              />
-            </AnimatePresence>
-            <p className="mt-3 text-center text-xs text-muted-foreground sm:hidden">
-              Swipe right for funny, left for not funny.
-            </p>
-          </div>
-        ) : isFinished ? (
-          <div
-            className="bg-gray-50 dark:bg-neutral-800 rounded-2xl p-8 flex flex-col
-                       items-center text-center gap-4"
-          >
-            <BrandImage variant="mark" alt="Crackd Logo" className="w-16 h-16" />
-            <h2 className="text-2xl font-bold">You&apos;ve seen everything fresh</h2>
-            <p className="text-sm text-muted-foreground max-w-sm">
-              {ratedCount > 0
-                ? `You rated ${ratedCount} caption${ratedCount === 1 ? "" : "s"} this session. `
-                : ""}
-              Check back later for new captions, or see what&apos;s winning right now.
-            </p>
-            <div className="flex gap-3">
-              <Link
-                href="/top-100/all-time"
-                className="px-4 py-2 rounded-full bg-primary text-white text-sm font-medium
-                           hover:bg-primary/90 transition-colors"
-              >
-                Go to Top 100
-              </Link>
-              <button
-                type="button"
-                onClick={() => void handleStartOver()}
-                className="px-4 py-2 rounded-full border border-[#666363] text-sm font-medium
-                           hover:bg-gray-100 dark:hover:bg-neutral-700 transition-colors"
-              >
-                Start over
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div
-            className="bg-gray-50 dark:bg-neutral-800 rounded-2xl aspect-[4/5] sm:aspect-square
-                       animate-pulse"
-            aria-busy="true"
-            aria-label="Loading captions"
-          />
-        )}
-
-        {!isAuthenticated && current && (
-          <p className="mt-4 text-center text-xs text-muted-foreground">
-            You can browse without an account. Voting asks you to log in.
-          </p>
-        )}
+        {ratePanel}
       </div>
 
       <LoginPromptModal

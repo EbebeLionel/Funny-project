@@ -11,7 +11,6 @@ export default function NavigationMenu() {
   const navItems = [
     { label: "Top 100", href: "/" },
     { label: "Fresh", href: "/fresh" },
-    { label: "Votes", href: "/votes" },
     { label: "Favorites", href: "/favorites" },
     { label: "Images", href: "/my-images" },
   ];

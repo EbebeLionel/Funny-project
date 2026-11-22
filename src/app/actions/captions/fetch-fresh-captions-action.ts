@@ -9,6 +9,11 @@ export type FreshCaption = {
   image_url: string;
   like_count: number;
   created_at: string;
+  /**
+   * True when the caption comes from the wider pool of older captions, used
+   * once the user has rated every near-zero (fresh) caption.
+   */
+  from_older_pool: boolean;
 };
 
 /** How many candidate rows to pull from the database per request. */
@@ -137,8 +142,10 @@ export const fetchFreshCaptionsAction = async (
   // Prefer captions nobody has judged yet. If the user has worked through all
   // of those, widen to every public caption they have not voted on.
   let pool = await loadPool(true);
+  let fromOlderPool = false;
   if (pool.filter((row) => !excluded.has(row.id)).length === 0) {
     pool = await loadPool(false);
+    fromOlderPool = true;
   }
 
   const candidates = pool
@@ -150,6 +157,7 @@ export const fetchFreshCaptionsAction = async (
       image_url: imageOf(row)?.url ?? "",
       like_count: row.like_count ?? 0,
       created_at: row.created_datetime_utc,
+      from_older_pool: fromOlderPool,
     }));
 
   // Randomise, then bring the least-judged captions (score closest to zero) to
@@ -179,4 +187,22 @@ export const fetchCaptionScoreAction = async (captionId: string): Promise<number
     return null;
   }
   return data?.like_count ?? null;
+};
+
+/** Current net scores for several captions, keyed by caption id. */
+export const fetchCaptionScoresAction = async (
+  captionIds: string[]
+): Promise<Record<string, number>> => {
+  if (captionIds.length === 0) return {};
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("captions")
+    .select("id, like_count")
+    .in("id", captionIds);
+
+  if (error) {
+    console.error("Error fetching caption scores:", error);
+    return {};
+  }
+  return Object.fromEntries((data ?? []).map((row) => [row.id, row.like_count ?? 0]));
 };

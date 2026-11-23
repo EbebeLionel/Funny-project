@@ -56,12 +56,14 @@ const shuffle = <T,>(items: T[]) => {
  *
  * - Leaves out captions the signed-in user has already voted on.
  * - Leaves out `excludeIds` (captions already shown in this session).
+ * - Keeps only captions of one humor flavor when `flavorId` is set.
  * - Puts captions with few votes first, newest first within that, with some
  *   randomness so two people do not see the identical sequence.
  */
 export const fetchFreshCaptionsAction = async (
   limit = 20,
-  excludeIds: string[] = []
+  excludeIds: string[] = [],
+  flavorId: number | null = null
 ): Promise<FreshCaption[]> => {
   const supabase = await createClient();
   const {
@@ -106,6 +108,9 @@ export const fetchFreshCaptionsAction = async (
       .eq("is_public", true)
       .eq("images.is_public", true)
       .not("images.url", "is", null);
+    if (flavorId !== null) {
+      query = query.eq("humor_flavor_id", flavorId);
+    }
     if (nearZeroOnly) {
       query = query.gte("like_count", FRESH_SCORE_MIN).lte("like_count", FRESH_SCORE_MAX);
     }

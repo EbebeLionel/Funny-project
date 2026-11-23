@@ -10,13 +10,32 @@ import {
   useTransform,
   type PanInfo,
 } from "framer-motion";
-import { ChevronUp, ChevronDown, SkipForward, Undo2 } from "lucide-react";
+import {
+  ChevronUp,
+  ChevronDown,
+  Flame,
+  Sparkles,
+  SkipForward,
+  Trophy,
+  Undo2,
+  X,
+} from "lucide-react";
 import {
   fetchCaptionScoreAction,
   fetchCaptionScoresAction,
   fetchFreshCaptionsAction,
   type FreshCaption,
 } from "@/app/actions/captions/fetch-fresh-captions-action";
+import {
+  fetchRatingStatsAction,
+  fetchTop100WinsAction,
+  type RatingStats,
+  type Top100Win,
+} from "@/app/actions/captions/fetch-rating-stats-action";
+import {
+  fetchFlavorOptionsAction,
+  type FlavorOption,
+} from "@/app/actions/captions/fetch-flavor-options-action";
 import { toggleCaptionVoteAction } from "@/app/actions/captions";
 import { checkAuthStatusAction } from "@/app/actions/auth/check-auth-status";
 import { LoginPromptModal } from "@/components/ui/login-prompt-modal";
@@ -65,6 +84,112 @@ type LastRating = {
 };
 
 const formatScore = (score: number) => (score > 0 ? `+${score}` : `${score}`);
+
+/** Ratings per day that fill the progress ring. */
+const DAILY_GOAL = 20;
+/** Session counts that get a small celebration. */
+const MILESTONES = [10, 25, 50];
+const MILESTONE_MESSAGES: Record<number, string> = {
+  10: "Nice rhythm. Every vote helps a new caption find its audience.",
+  25: "You're a seasoned judge now.",
+  50: "Fifty! That's a serious judging session.",
+};
+/** How long (ms) a celebration banner stays up on its own. */
+const CELEBRATION_MS = 4000;
+/** Top 100 captions the user has already been told about (localStorage). */
+const WINS_SEEN_KEY = "funnybone:top100-wins-seen";
+
+const readSeenWins = (): Set<string> => {
+  try {
+    const raw = window.localStorage.getItem(WINS_SEEN_KEY);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch {
+    return new Set();
+  }
+};
+
+const writeSeenWins = (ids: string[]) => {
+  try {
+    const seen = readSeenWins();
+    ids.forEach((id) => seen.add(id));
+    window.localStorage.setItem(WINS_SEEN_KEY, JSON.stringify(Array.from(seen)));
+  } catch {
+    // Storage can be unavailable (private mode); the notice just shows again.
+  }
+};
+
+type Celebration =
+  | { kind: "milestone"; count: number }
+  | { kind: "goal"; count: number };
+
+/** Small ring that fills as today's ratings approach the daily goal. */
+function GoalRing({ value, goal }: { value: number; goal: number }) {
+  const radius = 15;
+  const circumference = 2 * Math.PI * radius;
+  const progress = Math.min(1, value / goal);
+  const done = value >= goal;
+  return (
+    <svg viewBox="0 0 36 36" className="w-9 h-9 -rotate-90 shrink-0" aria-hidden="true">
+      <circle
+        cx="18"
+        cy="18"
+        r={radius}
+        fill="none"
+        strokeWidth="4"
+        className="stroke-gray-200 dark:stroke-neutral-700"
+      />
+      <motion.circle
+        cx="18"
+        cy="18"
+        r={radius}
+        fill="none"
+        strokeWidth="4"
+        strokeLinecap="round"
+        className="stroke-primary"
+        strokeDasharray={circumference}
+        initial={false}
+        animate={{ strokeDashoffset: circumference * (1 - progress) }}
+        transition={{ type: "spring", stiffness: 120, damping: 20 }}
+      />
+      {done && (
+        <circle cx="18" cy="18" r="7" className="fill-primary" />
+      )}
+    </svg>
+  );
+}
+
+/** Flavor chips that restart the feed with one humor flavor. */
+function FlavorChips({
+  flavors,
+  active,
+  onPick,
+}: {
+  flavors: FlavorOption[];
+  active: FlavorOption | null;
+  onPick: (flavor: FlavorOption | null) => void;
+}) {
+  if (flavors.length === 0) return null;
+  return (
+    <div className="flex flex-wrap justify-center gap-2">
+      {flavors.map((flavor) => (
+        <button
+          key={flavor.id}
+          type="button"
+          onClick={() => onPick(flavor)}
+          aria-pressed={active?.id === flavor.id}
+          className={cn(
+            "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+            active?.id === flavor.id
+              ? "border-primary bg-primary text-white"
+              : "border-[#666363] hover:border-primary hover:text-primary"
+          )}
+        >
+          {flavor.name}
+        </button>
+      ))}
+    </div>
+  );
+}
 
 /* ------------------------------------------------------------------------ */
 /* Card                                                                      */
@@ -292,9 +417,30 @@ export default function FreshFeedClient({
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [exhausted, setExhausted] = useState(initialCaptions.length === 0);
 
+  // Persisted counters. `sessionBase` is the session count when the stats
+  // arrived; votes after that are added on top locally.
+  const [stats, setStats] = useState<(RatingStats & { sessionBase: number }) | null>(null);
+  const statsRef = useRef(stats);
+  const ratedCountRef = useRef(0);
+  const [celebration, setCelebration] = useState<Celebration | null>(null);
+  const celebratedRef = useRef<Set<number>>(new Set());
+  const goalCelebratedRef = useRef(false);
+  // The user chose to stop after hitting the daily goal.
+  const [wrappedUp, setWrappedUp] = useState(false);
+  // Upvoted captions now in the Top 100 that the user has not been told about.
+  const [wins, setWins] = useState<Top100Win[]>([]);
+  const [flavors, setFlavors] = useState<FlavorOption[]>([]);
+  const flavorsRequestedRef = useRef(false);
+  const [flavor, setFlavor] = useState<FlavorOption | null>(null);
+  const flavorRef = useRef<FlavorOption | null>(null);
+
   // Ids seen in this session so a refill never repeats a skipped caption.
   const seenIdsRef = useRef<Set<string>>(new Set(initialCaptions.map((c) => c.id)));
-  const loadingRef = useRef(false);
+  // Bumped whenever the queue is reset, so a load started before the reset is
+  // dropped instead of mixing old results into the new queue.
+  const generationRef = useRef(0);
+  // Generation of the load in flight, or -1 when none is.
+  const loadingRef = useRef(-1);
   // Latest index, readable from async callbacks that outlive a render.
   const indexRef = useRef(0);
   indexRef.current = index;
@@ -326,12 +472,79 @@ export default function FreshFeedClient({
     img.src = next.image_url;
   }, [next?.image_url]);
 
+  // Rating counters and Top 100 news, loaded from the database once signed in.
+  useEffect(() => {
+    if (!isAuthenticated) {
+      statsRef.current = null;
+      setStats(null);
+      setWins([]);
+      return;
+    }
+    let cancelled = false;
+    fetchRatingStatsAction(new Date().getTimezoneOffset())
+      .then((loaded) => {
+        if (cancelled || !loaded) return;
+        const next = { ...loaded, sessionBase: ratedCountRef.current };
+        // Only celebrate the goal when it is crossed in this session.
+        goalCelebratedRef.current = loaded.today >= DAILY_GOAL;
+        statsRef.current = next;
+        setStats(next);
+      })
+      .catch((error) => console.error("Could not load rating stats:", error));
+    fetchTop100WinsAction()
+      .then((all) => {
+        if (cancelled) return;
+        const seen = readSeenWins();
+        setWins(all.filter((w) => !seen.has(w.captionId)));
+      })
+      .catch((error) => console.error("Could not load Top 100 wins:", error));
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated]);
+
+  const dismissWins = useCallback(() => {
+    writeSeenWins(wins.map((w) => w.captionId));
+    setWins([]);
+  }, [wins]);
+
+  // Milestone banners disappear on their own; the goal banner waits for a choice.
+  useEffect(() => {
+    if (celebration?.kind !== "milestone") return;
+    const timer = window.setTimeout(() => setCelebration(null), CELEBRATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [celebration]);
+
+  /** Change the session count and celebrate milestones and the daily goal. */
+  const changeRatedCount = useCallback((delta: 1 | -1) => {
+    const count = Math.max(0, ratedCountRef.current + delta);
+    ratedCountRef.current = count;
+    setRatedCount(count);
+    if (delta < 0) return;
+
+    const s = statsRef.current;
+    const today = s ? s.today + count - s.sessionBase : count;
+    if (s && today >= DAILY_GOAL && !goalCelebratedRef.current) {
+      goalCelebratedRef.current = true;
+      setCelebration({ kind: "goal", count: today });
+    } else if (MILESTONES.includes(count) && !celebratedRef.current.has(count)) {
+      celebratedRef.current.add(count);
+      setCelebration({ kind: "milestone", count });
+    }
+  }, []);
+
   const loadMore = useCallback(async () => {
-    if (loadingRef.current) return;
-    loadingRef.current = true;
+    const generation = generationRef.current;
+    if (loadingRef.current === generation) return;
+    loadingRef.current = generation;
     setIsLoadingMore(true);
     try {
-      const more = await fetchFreshCaptionsAction(PAGE_SIZE, Array.from(seenIdsRef.current));
+      const more = await fetchFreshCaptionsAction(
+        PAGE_SIZE,
+        Array.from(seenIdsRef.current),
+        flavorRef.current?.id ?? null
+      );
+      if (generation !== generationRef.current) return;
       const fresh = more.filter((c) => !seenIdsRef.current.has(c.id));
       fresh.forEach((c) => seenIdsRef.current.add(c.id));
       if (fresh.length === 0) {
@@ -347,10 +560,37 @@ export default function FreshFeedClient({
         variant: "destructive",
       });
     } finally {
-      loadingRef.current = false;
-      setIsLoadingMore(false);
+      // A newer load may have started after a reset; leave its flag alone.
+      if (loadingRef.current === generation) {
+        loadingRef.current = -1;
+        setIsLoadingMore(false);
+      }
     }
   }, [toast]);
+
+  /** Empty the queue and load again, e.g. after picking a flavor. */
+  const resetQueue = useCallback(
+    (options: { forgetSeen: boolean }) => {
+      generationRef.current += 1;
+      if (options.forgetSeen) seenIdsRef.current = new Set();
+      setQueue([]);
+      setIndex(0);
+      setExhausted(false);
+      setLastRating(null);
+      setWrappedUp(false);
+      void loadMore();
+    },
+    [loadMore]
+  );
+
+  const pickFlavor = useCallback(
+    (next: FlavorOption | null) => {
+      flavorRef.current = next;
+      setFlavor(next);
+      resetQueue({ forgetSeen: false });
+    },
+    [resetQueue]
+  );
 
   // Refill before the queue runs dry.
   useEffect(() => {
@@ -398,7 +638,7 @@ export default function FreshFeedClient({
       void (async () => {
         try {
           await toggleCaptionVoteAction(caption.id, vote);
-          setRatedCount((n) => n + 1);
+          changeRatedCount(1);
           setLastRating((prev) =>
             prev?.caption.id === caption.id ? { ...prev, status: "saved" } : prev
           );
@@ -437,7 +677,7 @@ export default function FreshFeedClient({
         }
       })();
     },
-    [current, isAuthenticated, advance, restore, toast]
+    [current, isAuthenticated, advance, restore, toast, changeRatedCount]
   );
 
   const handleUndo = useCallback(() => {
@@ -449,7 +689,7 @@ export default function FreshFeedClient({
       try {
         // Voting the same way again removes the vote (repo voting rules).
         await toggleCaptionVoteAction(caption.id, vote);
-        setRatedCount((n) => Math.max(0, n - 1));
+        changeRatedCount(-1);
         setLastRating(null);
         setSessionRatings((prev) => prev.filter((r) => r.caption.id !== caption.id));
         restore(caption);
@@ -463,13 +703,13 @@ export default function FreshFeedClient({
         });
       }
     })();
-  }, [lastRating, restore, toast]);
+  }, [lastRating, restore, toast, changeRatedCount]);
 
   // Keyboard: ↑ upvote, ↓ downvote, → skip, Backspace undo. Ignored while
   // typing or when a dialog is open.
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (showLoginPrompt) return;
+      if (showLoginPrompt || wrappedUp) return;
       const target = event.target as HTMLElement | null;
       const tag = target?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || target?.isContentEditable) return;
@@ -490,20 +730,31 @@ export default function FreshFeedClient({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [handleVote, handleSkip, handleUndo, showLoginPrompt]);
+  }, [handleVote, handleSkip, handleUndo, showLoginPrompt, wrappedUp]);
 
-  const handleStartOver = async () => {
-    seenIdsRef.current = new Set();
-    setQueue([]);
-    setIndex(0);
-    setExhausted(false);
-    setLastRating(null);
-    await loadMore();
-  };
+  const handleStartOver = () => resetQueue({ forgetSeen: true });
 
-  const isFinished = !current && exhausted && !isLoadingMore;
+  // Ran out of captions, or stopped after reaching the daily goal.
+  const isFinished = (!current && exhausted && !isLoadingMore) || wrappedUp;
   // The feed widens to older captions once every near-zero caption is rated.
   const sawOlderPool = queue.some((c) => c.from_older_pool);
+
+  // Flavor filters are only offered once the new captions run out.
+  const needFlavors = sawOlderPool || isFinished;
+  useEffect(() => {
+    if (!needFlavors || flavorsRequestedRef.current) return;
+    flavorsRequestedRef.current = true;
+    fetchFlavorOptionsAction()
+      .then(setFlavors)
+      .catch((error) => console.error("Could not load flavors:", error));
+  }, [needFlavors]);
+
+  // Counters shown in the header: database totals plus votes since they loaded.
+  const sinceStats = stats ? ratedCount - stats.sessionBase : 0;
+  const todayCount = stats ? Math.max(0, stats.today + sinceStats) : ratedCount;
+  const totalCount = stats ? Math.max(0, stats.total + sinceStats) : ratedCount;
+  // A first vote today extends a streak that so far ran through yesterday.
+  const streak = stats ? stats.streak + (!stats.activeToday && todayCount > 0 ? 1 : 0) : 0;
 
   // Keep the scores in the strip (or the end-screen recap) live while the page
   // is visible.
@@ -575,20 +826,111 @@ export default function FreshFeedClient({
         </AnimatePresence>
       </div>
 
-      {/* Explain the switch to older captions (Iteration 1 gap) */}
-      {current?.from_older_pool && (
-        <p
-          className="mb-4 rounded-xl border border-dashed border-[#666363] px-4 py-2 text-sm
-                     text-muted-foreground"
+      {/* Upvoted captions that have since reached the Top 100 */}
+      {wins.length > 0 && (
+        <div
+          className="mb-4 rounded-xl border border-primary/40 bg-primary/5 px-4 py-3 text-sm"
           role="status"
         >
-          You&apos;ve rated every new caption. Now showing older captions you haven&apos;t
-          voted on yet.
-        </p>
+          <div className="flex items-start gap-2">
+            <Trophy className="w-4 h-4 mt-0.5 shrink-0 text-primary" />
+            <div className="flex-1 min-w-0">
+              <p className="font-semibold">
+                {wins.length === 1
+                  ? "A caption you upvoted is in the Top 100"
+                  : `${wins.length} captions you upvoted are in the Top 100`}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                You made a difference. Your vote helped put them there.
+              </p>
+              <ul className="mt-2 space-y-1.5">
+                {wins.slice(0, 3).map((w) => (
+                  <li key={w.captionId}>
+                    <Link
+                      href={`/top-100/all-time#caption-${w.captionId}`}
+                      onClick={dismissWins}
+                      className="flex items-center gap-2 rounded-lg hover:text-primary"
+                    >
+                      {w.imageUrl && (
+                        <img
+                          src={w.imageUrl}
+                          alt=""
+                          className="w-8 h-8 shrink-0 rounded-md object-cover"
+                          loading="lazy"
+                        />
+                      )}
+                      <span className="w-9 shrink-0 font-semibold text-primary">
+                        {`#${w.rank}`}
+                      </span>
+                      <span className="min-w-0 truncate">{w.content}</span>
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+              {wins.length > 3 && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {`And ${wins.length - 3} more in the Top 100.`}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={dismissWins}
+              className="rounded-full p-1 text-muted-foreground hover:bg-primary/10
+                         hover:text-primary transition-colors"
+              aria-label="Dismiss Top 100 notice"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Active flavor filter */}
+      {flavor && !isFinished && (
+        <div
+          className="mb-4 flex items-center justify-between gap-2 rounded-xl bg-gray-50
+                     dark:bg-neutral-800 px-4 py-2 text-sm"
+        >
+          <span>
+            {"Showing "}
+            <span className="font-semibold text-primary">{flavor.name}</span>
+            {" captions"}
+          </span>
+          <button
+            type="button"
+            onClick={() => pickFlavor(null)}
+            className="text-xs font-medium text-primary hover:underline"
+          >
+            All captions
+          </button>
+        </div>
+      )}
+
+      {/* Explain the switch to older captions and offer a way to narrow it */}
+      {current?.from_older_pool && !wrappedUp && (
+        <div
+          className="mb-4 rounded-xl border border-dashed border-[#666363] px-4 py-3 text-sm
+                     text-muted-foreground space-y-2"
+          role="status"
+        >
+          <p>
+            {flavor
+              ? `You've rated every new ${flavor.name} caption. ` +
+                "Here are older ones you haven't voted on yet."
+              : "You've rated every new caption. Here are older ones you haven't voted on yet."}
+          </p>
+          {!flavor && flavors.length > 0 && (
+            <>
+              <p className="text-xs">Or keep going with one humor flavor:</p>
+              <FlavorChips flavors={flavors} active={flavor} onPick={pickFlavor} />
+            </>
+          )}
+        </div>
       )}
 
       {/* Card */}
-      {current ? (
+      {current && !wrappedUp ? (
         <div className="relative">
           <AnimatePresence mode="popLayout" custom={exitDirection} initial={false}>
             <SwipeCard
@@ -609,15 +951,43 @@ export default function FreshFeedClient({
         >
           <BrandImage variant="mark" alt="Crackd Logo" className="w-16 h-16" />
           <h2 className="text-2xl font-bold">
-            {sawOlderPool ? "You've rated everything available" : "You've seen everything fresh"}
+            {wrappedUp
+              ? "Daily goal done"
+              : flavor
+                ? `You've rated everything in ${flavor.name}`
+                : sawOlderPool
+                  ? "You've rated everything available"
+                  : "You've seen everything fresh"}
           </h2>
           <p className="text-sm text-muted-foreground max-w-sm">
-            {sawOlderPool
-              ? "You rated every new caption, then went through the older ones " +
-                "you hadn't voted on. "
-              : ""}
-            Check back later for new captions, or see what&apos;s winning right now.
+            {wrappedUp
+              ? `You rated ${todayCount} captions today` +
+                (streak > 1 ? ` and your streak is at ${streak} days. ` : ". ") +
+                "Come back tomorrow to keep it going."
+              : flavor
+                ? "Try another flavor, or go back to all captions."
+                : sawOlderPool
+                  ? "You rated every new caption, then the older ones you hadn't voted on " +
+                    "that we could find. Pick a flavor below to keep going, or check back " +
+                    "later for new captions."
+                  : "Check back later for new captions, or see what's winning right now."}
           </p>
+
+          {!wrappedUp && flavors.length > 0 && (
+            <div className="w-full space-y-2">
+              <h3 className="text-sm font-semibold">Keep going with a humor flavor</h3>
+              <FlavorChips flavors={flavors} active={flavor} onPick={pickFlavor} />
+              {flavor && (
+                <button
+                  type="button"
+                  onClick={() => pickFlavor(null)}
+                  className="text-xs font-medium text-primary hover:underline"
+                >
+                  Back to all captions
+                </button>
+              )}
+            </div>
+          )}
 
           {sessionRatings.length > 0 && (
             <div className="w-full text-left">
@@ -663,6 +1033,16 @@ export default function FreshFeedClient({
           )}
 
           <div className="flex flex-wrap justify-center gap-3">
+            {wrappedUp && (
+              <button
+                type="button"
+                onClick={() => setWrappedUp(false)}
+                className="px-4 py-2 rounded-full bg-primary text-white text-sm font-medium
+                           hover:bg-primary/90 transition-colors"
+              >
+                Keep rating
+              </button>
+            )}
             <Link
               href={sessionRatings.length > 0 ? RECENT_VOTES_HREF : "/top-100/all-time"}
               className="px-4 py-2 rounded-full bg-primary text-white text-sm font-medium
@@ -670,14 +1050,16 @@ export default function FreshFeedClient({
             >
               {sessionRatings.length > 0 ? "See your votes in Top 100" : "Go to Top 100"}
             </Link>
-            <button
-              type="button"
-              onClick={() => void handleStartOver()}
-              className="px-4 py-2 rounded-full border border-[#666363] text-sm font-medium
-                         hover:bg-gray-100 dark:hover:bg-neutral-700 transition-colors"
-            >
-              Start over
-            </button>
+            {!wrappedUp && (
+              <button
+                type="button"
+                onClick={handleStartOver}
+                className="px-4 py-2 rounded-full border border-[#666363] text-sm font-medium
+                           hover:bg-gray-100 dark:hover:bg-neutral-700 transition-colors"
+              >
+                Start over
+              </button>
+            )}
           </div>
         </div>
       ) : (
@@ -690,7 +1072,7 @@ export default function FreshFeedClient({
       )}
 
       {/* Recently rated strip */}
-      {current && sessionRatings.length > 0 && (
+      {current && !wrappedUp && sessionRatings.length > 0 && (
         <section className="mt-5" aria-label="Recently rated">
           <div className="mb-2 flex items-center justify-between text-xs text-muted-foreground">
             <span>Recently rated · live scores</span>
@@ -727,17 +1109,129 @@ export default function FreshFeedClient({
               Captions that haven&apos;t been rated yet. Be the first to judge.
             </p>
           </div>
-          <div
-            className="self-start sm:self-auto shrink-0 rounded-full border border-[#666363]
-                       px-3 py-1 text-sm text-muted-foreground"
-            aria-live="polite"
-          >
-            Rated today: <span className="text-primary font-semibold">{ratedCount}</span>
-          </div>
+          {stats ? (
+            <div className="self-start sm:self-auto shrink-0 flex items-center gap-3">
+              <div
+                className="flex items-center gap-2"
+                title={`Daily goal: rate ${DAILY_GOAL} captions`}
+                aria-live="polite"
+              >
+                <GoalRing value={todayCount} goal={DAILY_GOAL} />
+                <div className="leading-tight">
+                  <p className="text-sm font-semibold">
+                    <span className="text-primary">{todayCount}</span>
+                    {` / ${DAILY_GOAL} today`}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {todayCount >= DAILY_GOAL ? "Daily goal done" : `Goal: rate ${DAILY_GOAL}`}
+                  </p>
+                </div>
+              </div>
+              <div className="h-8 w-px bg-gray-200 dark:bg-neutral-700" aria-hidden="true" />
+              <div className="leading-tight">
+                <p className="flex items-center gap-1 text-sm font-semibold">
+                  <Flame
+                    className={cn(
+                      "w-4 h-4",
+                      streak > 0 ? "text-orange-500" : "text-muted-foreground"
+                    )}
+                    aria-hidden="true"
+                  />
+                  {streak > 0 ? `${streak}-day streak` : "No streak yet"}
+                </p>
+                <p className="text-xs text-muted-foreground">{`${totalCount} rated all time`}</p>
+              </div>
+            </div>
+          ) : (
+            <div
+              className="self-start sm:self-auto shrink-0 rounded-full border border-[#666363]
+                         px-3 py-1 text-sm text-muted-foreground"
+              aria-live="polite"
+            >
+              {"Rated today: "}
+              <span className="text-primary font-semibold">{ratedCount}</span>
+            </div>
+          )}
         </div>
 
         {ratePanel}
       </div>
+
+      {/* Milestone and daily-goal celebrations */}
+      <AnimatePresence>
+        {celebration && (
+          <motion.div
+            key={`${celebration.kind}-${celebration.count}`}
+            initial={{ opacity: 0, y: 40, scale: 0.92 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 40 }}
+            transition={{ type: "spring", stiffness: 380, damping: 26 }}
+            className="fixed inset-x-4 bottom-6 z-50 mx-auto max-w-sm rounded-2xl bg-primary
+                       p-4 text-white shadow-lg"
+            role="status"
+          >
+            <div className="flex items-start gap-3">
+              <motion.span
+                initial={{ rotate: -30, scale: 0.4 }}
+                animate={{ rotate: 0, scale: 1 }}
+                transition={{ type: "spring", stiffness: 300, damping: 9 }}
+                className="mt-0.5"
+                aria-hidden="true"
+              >
+                {celebration.kind === "goal" ? (
+                  <Trophy className="w-6 h-6" />
+                ) : (
+                  <Sparkles className="w-6 h-6" />
+                )}
+              </motion.span>
+              <div className="flex-1">
+                <p className="font-bold">
+                  {celebration.kind === "goal"
+                    ? "Daily goal done!"
+                    : `${celebration.count} ratings this session!`}
+                </p>
+                <p className="text-sm text-white/85">
+                  {celebration.kind === "goal"
+                    ? `You've rated ${celebration.count} captions today. ` +
+                      "Stop here or keep going, it's up to you."
+                    : (MILESTONE_MESSAGES[celebration.count] ?? "Keep it up.")}
+                </p>
+                {celebration.kind === "goal" && (
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setCelebration(null);
+                        setWrappedUp(true);
+                      }}
+                      className="rounded-full bg-white px-3 py-1 text-xs font-semibold
+                                 text-primary hover:bg-white/90 transition-colors"
+                    >
+                      Wrap up
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCelebration(null)}
+                      className="rounded-full border border-white/60 px-3 py-1 text-xs
+                                 font-semibold hover:bg-white/10 transition-colors"
+                    >
+                      Keep going
+                    </button>
+                  </div>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setCelebration(null)}
+                className="rounded-full p-1 hover:bg-white/15 transition-colors"
+                aria-label="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <LoginPromptModal
         open={showLoginPrompt}
